@@ -255,29 +255,56 @@ void S3AuthParams::SetRegion(string new_region) {
 	InitializeEndpoint();
 }
 
-bool S3AuthParams::TryRefreshCredentials() {
-	if (!opener) {
-		return false;
-	}
-
-	// Try to refresh the secret using S3FileSystem helper
-	if (S3FileSystem::TryRefreshSecret(path, opener)) {
-		// Refresh succeeded, reload credentials
+bool S3AuthParams::RefreshCredentialsLocked() {
+	// Caller holds *refresh_mutex. TryRefreshSecret/ReadFrom operate on the secret manager
+	// and a freshly-constructed S3AuthParams, not on *this, so the non-recursive mutex is
+	// held across them safely.
+	bool ok = false;
+	if (opener && S3FileSystem::TryRefreshSecret(path, opener)) {
+		// Reload the refreshed credentials into the existing fields, leaving refresh_mutex
+		// and refresh_generation intact.
 		FileOpenerInfo info = {path};
 		auto refreshed_params = S3AuthParams::ReadFrom(opener, info);
-
-		// Update this object's credentials
 		this->access_key_id = refreshed_params.access_key_id;
 		this->secret_access_key = refreshed_params.secret_access_key;
 		this->session_token = refreshed_params.session_token;
 		this->region = refreshed_params.region;
 		this->endpoint = refreshed_params.endpoint;
 		this->oauth2_bearer_token = refreshed_params.oauth2_bearer_token;
-
-		return true;
+		ok = true;
 	}
+	// Record the outcome and advance the generation. A request that captured an earlier
+	// generation reads this result; a later request captures the new generation before
+	// deciding whether to refresh.
+	refresh_generation++;
+	refresh_last_succeeded = ok;
+	return ok;
+}
 
-	return false;
+bool S3AuthParams::TryRefreshCredentials() {
+	// Single-threaded open path (S3FileHandle::Initialize): refresh under the lock.
+	lock_guard<mutex> guard(*refresh_mutex);
+	return RefreshCredentialsLocked();
+}
+
+bool S3AuthParams::TryRefreshCredentials(idx_t captured_generation) {
+	lock_guard<mutex> guard(*refresh_mutex);
+	if (refresh_generation > captured_generation) {
+		// A refresh attempt completed after this request was signed; return its result.
+		return refresh_last_succeeded;
+	}
+	return RefreshCredentialsLocked();
+}
+
+S3AuthParams S3AuthParams::Snapshot() const {
+	lock_guard<mutex> guard(*refresh_mutex);
+	return *this;
+}
+
+S3AuthParams S3AuthParams::Snapshot(idx_t &out_generation) const {
+	lock_guard<mutex> guard(*refresh_mutex);
+	out_generation = refresh_generation;
+	return *this;
 }
 
 unique_ptr<KeyValueSecret> CreateSecret(vector<string> &prefix_paths_p, string &type, string &provider, string &name,
@@ -394,7 +421,8 @@ void S3FileHandle::FinalizeUpload() {
 }
 
 unique_ptr<HTTPClient> S3FileHandle::CreateClient() {
-	auto parsed_url = S3FileSystem::S3UrlParse(path, this->auth_params);
+	// Read region/endpoint from a consistent snapshot taken under the refresh lock.
+	auto parsed_url = S3FileSystem::S3UrlParse(path, this->auth_params.Snapshot());
 	string proto_host_port = parsed_url.http_proto + parsed_url.host;
 	return http_params.http_util.InitializeClient(http_params, proto_host_port);
 }
@@ -564,13 +592,35 @@ string ParsedS3Url::GetHTTPUrl(S3AuthParams &auth_params, const string &http_que
 
 template <typename RequestFunc>
 auto ExecuteWithRefresh(S3AuthParams &auth_params, RequestFunc request_func) -> decltype(request_func(auth_params)) {
+	// Sign against a consistent snapshot of the credentials, captured together with the
+	// generation it corresponds to. The snapshot also backs the request lambda's own
+	// credential reads (e.g. oauth2_bearer_token).
+	idx_t captured_generation = 0;
+	S3AuthParams snapshot = auth_params.Snapshot(captured_generation);
+	string region_before = snapshot.region;
 	try {
-		return request_func(auth_params);
+		auto result = request_func(snapshot);
+		// The glob path's AWSListObjectV2::Request corrects the region on the snapshot on a
+		// 301; carry that back to the shared object so later calls use it. Only the
+		// sequential glob path writes region here; the concurrent request methods sign
+		// read-only.
+		if (snapshot.region != region_before) {
+			auth_params.SetRegion(snapshot.region);
+		}
+		return result;
 	} catch (std::exception &ex) {
 		ErrorData error(ex);
 		if (error.Type() == ExceptionType::IO || error.Type() == ExceptionType::HTTP) {
-			if (auth_params.TryRefreshCredentials()) {
-				return request_func(auth_params);
+			// At most one thread per generation contacts STS; the rest read its result.
+			// Retry once with the refreshed credentials.
+			if (auth_params.TryRefreshCredentials(captured_generation)) {
+				S3AuthParams refreshed = auth_params.Snapshot();
+				string refreshed_region_before = refreshed.region;
+				auto result = request_func(refreshed);
+				if (refreshed.region != refreshed_region_before) {
+					auth_params.SetRegion(refreshed.region);
+				}
+				return result;
 			}
 		}
 		throw;
@@ -597,7 +647,13 @@ unique_ptr<HTTPResponse> S3FileSystem::PostRequest(HTTPInput &input, string url,
 			                         "", payload_hash, "application/octet-stream");
 		}
 
-		return HTTPFileSystem::PostRequest(input, http_url, headers, result, buffer_in, buffer_in_len);
+		auto res = HTTPFileSystem::PostRequest(input, http_url, headers, result, buffer_in, buffer_in_len);
+		// PostRequest reports HTTP failures through the response status; surface them as an
+		// exception so ExecuteWithRefresh can refresh the credentials and retry.
+		if (static_cast<int>(res->status) >= 400) {
+			throw HTTPException(*res, "HTTP POST error on '%s' (HTTP %d)", http_url, static_cast<int>(res->status));
+		}
+		return res;
 	});
 }
 
@@ -622,7 +678,13 @@ unique_ptr<HTTPResponse> S3FileSystem::PutRequest(HTTPInput &input, string url, 
 			                         "", payload_hash, content_type);
 		}
 
-		return HTTPFileSystem::PutRequest(input, http_url, headers, buffer_in, buffer_in_len);
+		auto res = HTTPFileSystem::PutRequest(input, http_url, headers, buffer_in, buffer_in_len);
+		// PutRequest reports HTTP failures through the response status; surface them as an
+		// exception so ExecuteWithRefresh can refresh the credentials and retry.
+		if (static_cast<int>(res->status) >= 400) {
+			throw HTTPException(*res, "HTTP PUT error on '%s' (HTTP %d)", http_url, static_cast<int>(res->status));
+		}
+		return res;
 	});
 }
 
@@ -1395,16 +1457,18 @@ HTTPException S3FileSystem::GetS3Error(const S3AuthParams &s3_auth_params, const
 
 HTTPException S3FileSystem::GetHTTPError(FileHandle &handle, const HTTPResponse &response, const string &url) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
+	// Read the credential fields from a consistent snapshot taken under the refresh lock.
+	auto auth_snapshot = s3_handle.auth_params.Snapshot();
 
 	// Use GCS-specific error for GCS URLs
 	if (IsGCSRequest(url) && response.status == HTTPStatusCode::Forbidden_403) {
-		string extra_text = GetGCSAuthError(s3_handle.auth_params);
+		string extra_text = GetGCSAuthError(auth_snapshot);
 		auto status_message = HTTPFSUtil::GetStatusMessage(response.status);
 		throw HTTPException(response, "HTTP error on '%s' (HTTP %d %s)%s", url, response.status, status_message,
 		                    extra_text);
 	}
 
-	return GetS3Error(s3_handle.auth_params, response, url);
+	return GetS3Error(auth_snapshot, response, url);
 }
 
 string AWSListObjectV2::Request(const string &path, HTTPParams &http_params, S3AuthParams &s3_auth_params,

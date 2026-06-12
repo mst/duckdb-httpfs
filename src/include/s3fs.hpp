@@ -65,15 +65,40 @@ struct S3AuthParams {
 	optional_ptr<FileOpener> opener;
 	string path;
 
+	// Synchronization for credential refresh. All access to the credential fields and to
+	// refresh_generation is serialized by *refresh_mutex; read a consistent view via
+	// Snapshot() rather than reading the fields directly on a shared instance. The lock is
+	// a shared_ptr<mutex> (not a bare mutex) so S3AuthParams stays copyable: ReadFrom
+	// returns it by value and it is copied in several places. Copies that must coordinate
+	// refer to the same S3HTTPInput::auth_params object (S3FileHandle::auth_params is a
+	// reference to it; multipart workers share one shared_ptr<S3HTTPInput>), so they share
+	// one lock.
+	shared_ptr<mutex> refresh_mutex = make_shared_ptr<mutex>();
+	idx_t refresh_generation = 0;        // advanced on every completed refresh attempt; guarded by *refresh_mutex
+	bool refresh_last_succeeded = false; // result of the most recent completed attempt; guarded by *refresh_mutex
+
 	static S3AuthParams ReadFrom(optional_ptr<FileOpener> opener, FileOpenerInfo &info);
 	static S3AuthParams ReadFrom(S3KeyValueReader &secret_reader, const std::string &file_path);
 	void SetRegion(string region_p);
-	//! Try to refresh credentials if they've expired
-	//! Returns true if refresh succeeded and credentials were updated
+	//! Refresh credentials under *refresh_mutex, always attempting a refresh. Used by the
+	//! single-threaded open path (S3FileHandle::Initialize). Returns true if credentials
+	//! were updated.
 	bool TryRefreshCredentials();
+	//! Refresh credentials for a request that signed at refresh_generation ==
+	//! captured_generation. If a refresh attempt has completed since then, returns that
+	//! attempt's result; otherwise performs one refresh under *refresh_mutex.
+	bool TryRefreshCredentials(idx_t captured_generation);
+	//! Returns a copy of the credential fields taken under *refresh_mutex, for consistent
+	//! signing and error formatting.
+	S3AuthParams Snapshot() const;
+	//! As Snapshot(), also returning the refresh_generation the copy corresponds to.
+	S3AuthParams Snapshot(idx_t &out_generation) const;
 
 private:
 	void InitializeEndpoint();
+	//! Refresh the secret and reload the credential fields. Caller must hold *refresh_mutex.
+	//! Advances refresh_generation and records refresh_last_succeeded. Returns true on success.
+	bool RefreshCredentialsLocked();
 };
 
 struct AWSEnvironmentCredentialsProvider {
